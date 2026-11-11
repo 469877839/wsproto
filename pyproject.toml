@@ -23,6 +23,11 @@ requires-python = ">=3.10"
 dependencies = [
   "h11>=0.16.0,<1",
 ]
+
+[project.optional-dependencies]
+h2 = [
+  "h2>=4.0.0,<5",
+]
 dynamic = ["version"]
 
 # For a list of valid classifiers, see https://pypi.org/classifiers/
@@ -56,6 +61,7 @@ dev = [
 ]
 
 testing = [
+  "h2>=4.0.0,<5",
   "pytest>=8.3.3,<9",
   "pytest-cov>=6.0.0,<7",
   "pytest-xdist>=3.6.1,<4",
@@ -150,6 +156,13 @@ strict = true
 module = [
   "h11",
   "h11._headers",
+  "h2",
+  "h2.config",
+  "h2.connection",
+  "h2.errors",
+  "h2.events",
+  "h2.exceptions",
+  "h2.settings",
 ]
 ignore_missing_imports = true
 

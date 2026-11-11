@@ -109,3 +109,24 @@ Exceptions
 
 .. autoclass:: wsproto.utilities.RemoteProtocolError
    :members:
+
+HTTP/2 (RFC 8441)
+-----------------
+
+The :mod:`wsproto.h2` module is optional: it requires the ``h2`` package
+(install ``wsproto[h2]``). It carries any number of WebSocket streams over
+one HTTP/2 connection using extended CONNECT, reusing wsproto's frame and
+extension handling on every stream. It performs no network I/O.
+
+.. autoclass:: wsproto.h2.H2Connection
+   :special-members: __init__
+   :members:
+
+.. autoclass:: wsproto.h2.StreamEvent
+   :members:
+
+.. autoclass:: wsproto.h2.StreamClosed
+   :members:
+
+.. autoclass:: wsproto.h2.ConnectionTerminated
+   :members:

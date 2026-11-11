@@ -6,6 +6,10 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add ``wsproto.h2``, an optional Sans-I/O adapter that multiplexes
+  WebSocket connections over HTTP/2 extended CONNECT streams (RFC 8441)
+  using ``hyper-h2``. Install with the ``h2`` extra
+  (``pip install wsproto[h2]``); plain HTTP/1.1 usage is unaffected.
 
 1.3.2 (2025-11-20)
 ------------------
