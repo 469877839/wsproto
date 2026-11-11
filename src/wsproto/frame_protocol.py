@@ -611,7 +611,10 @@ class FrameProtocol:
         return self._serialize_frame(Opcode.PONG, payload)
 
     def send_data(
-        self, payload: bytes | bytearray | str = b"", fin: bool = True,
+        self,
+        payload: bytes | bytearray | str = b"",
+        fin: bool = True,
+        compress: bool | None = None,
     ) -> bytearray:
         if isinstance(payload, (bytes, bytearray, memoryview)):
             opcode = Opcode.BINARY
@@ -629,11 +632,14 @@ class FrameProtocol:
             raise TypeError(msg)
         else:
             opcode = Opcode.CONTINUATION
+            # The compression decision is taken from the first chunk of a
+            # message and cannot be changed by later chunks.
+            compress = None
 
         if fin:
             self._outbound_opcode = None
 
-        return self._serialize_frame(opcode, payload, fin)
+        return self._serialize_frame(opcode, payload, fin, compress)
 
     def _make_fin_rsv_opcode(self, fin: bool, rsv: RsvBits, opcode: Opcode) -> int:
         fin_bits = int(fin) << 7
@@ -643,13 +649,19 @@ class FrameProtocol:
         return fin_bits | rsv_bits | opcode_bits
 
     def _serialize_frame(
-        self, opcode: Opcode, payload: bytes | bytearray = b"", fin: bool = True,
+        self,
+        opcode: Opcode,
+        payload: bytes | bytearray = b"",
+        fin: bool = True,
+        compress: bool | None = None,
     ) -> bytearray:
         payload = bytearray(payload)
 
         rsv = RsvBits(False, False, False)
         for extension in reversed(self.extensions):
-            rsv, payload = extension.frame_outbound(self, opcode, rsv, bytes(payload), fin)
+            rsv, payload = extension.frame_outbound(
+                self, opcode, rsv, bytes(payload), fin, compress,
+            )
 
         fin_rsv_opcode = self._make_fin_rsv_opcode(fin, rsv, opcode)
 

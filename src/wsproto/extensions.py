@@ -8,9 +8,48 @@ from __future__ import annotations
 
 import zlib
 from abc import ABC, abstractmethod
-from typing import Optional
+from collections.abc import Callable
+from typing import NamedTuple, Optional
 
 from .frame_protocol import CloseReason, FrameDecoder, FrameProtocol, Opcode, RsvBits
+
+
+class MessageMetadata(NamedTuple):
+    """
+    Metadata describing an outbound message, as known before its first
+    frame is sent.
+
+    This is passed to a permessage-deflate compression strategy so that
+    the strategy can decide whether to compress the message without
+    having to buffer the complete message first.
+
+    .. attribute:: opcode
+
+       The opcode of the message's first frame, either
+       :attr:`Opcode.TEXT <wsproto.frame_protocol.Opcode.TEXT>` or
+       :attr:`Opcode.BINARY <wsproto.frame_protocol.Opcode.BINARY>`.
+
+    .. attribute:: payload_length
+
+       The length in bytes of the message's first frame payload. This
+       is the length of the first chunk handed to
+       :meth:`wsproto.Connection.send`, not necessarily the length of
+       the whole message.
+
+    .. attribute:: message_finished
+
+       True if the first frame is also the final frame of the message.
+    """
+
+    opcode: Opcode
+    payload_length: int
+    message_finished: bool
+
+
+#: A callable deciding, per message, whether permessage-deflate should
+#: compress it. It is called with the message's :class:`MessageMetadata`
+#: before the first frame of the message is sent.
+CompressionStrategy = Callable[[MessageMetadata], bool]
 
 
 class Extension(ABC):
@@ -55,6 +94,7 @@ class Extension(ABC):
         rsv: RsvBits,
         data: bytes,
         fin: bool,
+        compress: bool | None = None,
     ) -> tuple[RsvBits, bytes]:
         return (rsv, data)
 
@@ -71,6 +111,7 @@ class PerMessageDeflate(Extension):
         client_max_window_bits: int | None = None,
         server_no_context_takeover: bool = False,
         server_max_window_bits: int | None = None,
+        compress: bool | CompressionStrategy | None = None,
     ) -> None:
         self.client_no_context_takeover = client_no_context_takeover
         self.server_no_context_takeover = server_no_context_takeover
@@ -81,6 +122,11 @@ class PerMessageDeflate(Extension):
         if server_max_window_bits is not None:
             self.server_max_window_bits = server_max_window_bits
 
+        # The default compression policy for outbound messages that do not
+        # carry an explicit per-message compress hint.
+        self._compress: bool | CompressionStrategy | None = None
+        self.compress = compress
+
         self._compressor: Optional[zlib._Compress] = None  # noqa
         self._decompressor: Optional[zlib._Decompress] = None  # noqa
         # This refers to the current frame
@@ -89,8 +135,35 @@ class PerMessageDeflate(Extension):
         # frames). Only the first frame in a fragmented message is flagged for
         # compression, so this carries that bit forward.
         self._inbound_compressed: bool | None = None
+        # This refers to the ongoing outbound message (which might span
+        # multiple frames). The decision is taken once, before the first
+        # frame of the message is sent, and carries over to every
+        # continuation frame.
+        self._outbound_compressed: bool | None = None
 
         self._enabled = False
+
+    @property
+    def compress(self) -> bool | CompressionStrategy | None:
+        """
+        The default policy for outbound messages.
+
+        ``True`` compresses every data message, ``False`` sends every
+        data message uncompressed, and a callable is invoked with the
+        :class:`MessageMetadata` of each message before its first frame
+        is sent and returns whether that message should be compressed.
+        ``None`` keeps the historical behavior of compressing every data
+        message. Per-message hints on an outbound event take precedence
+        over this policy.
+        """
+        return self._compress
+
+    @compress.setter
+    def compress(self, value: bool | CompressionStrategy | None) -> None:
+        if value is not None and not isinstance(value, (bool, Callable)):
+            msg = "compress must be a bool, a callable or None"
+            raise TypeError(msg)
+        self._compress = value
 
     @property
     def client_max_window_bits(self) -> int:
@@ -206,7 +279,7 @@ class PerMessageDeflate(Extension):
 
         self._inbound_is_compressible = self._compressible_opcode(opcode)
 
-        if self._inbound_compressed is None:
+        if self._inbound_is_compressible and self._inbound_compressed is None:
             self._inbound_compressed = rsv.rsv1
             if self._inbound_compressed:
                 assert self._inbound_is_compressible
@@ -236,8 +309,10 @@ class PerMessageDeflate(Extension):
     ) -> bytes | CloseReason | None:
         if not fin:
             return None
+        # An interleaved control frame must not reset the compression state of
+        # an in-progress message; that state is only cleared by a message
+        # frame.
         if not self._inbound_is_compressible:
-            self._inbound_compressed = None
             return None
         if not self._inbound_compressed:
             self._inbound_compressed = None
@@ -262,6 +337,28 @@ class PerMessageDeflate(Extension):
 
         return data
 
+    def _resolve_compression(
+        self, opcode: Opcode, data: bytes, fin: bool, compress: bool | None,
+    ) -> bool:
+        # An explicit per-message hint takes precedence over the policy.
+        if compress is not None:
+            return compress
+        policy = self._compress
+        if policy is None or isinstance(policy, bool):
+            # None keeps the historical behavior of compressing every
+            # data message.
+            return policy is not False
+        # A strategy is called with the metadata known before the first
+        # frame of the message is sent; any exception it raises
+        # propagates before a single byte of the message is emitted.
+        return bool(
+            policy(
+                MessageMetadata(
+                    opcode=opcode, payload_length=len(data), message_finished=fin,
+                ),
+            ),
+        )
+
     def frame_outbound(
         self,
         proto: FrameDecoder | FrameProtocol,
@@ -269,8 +366,30 @@ class PerMessageDeflate(Extension):
         rsv: RsvBits,
         data: bytes,
         fin: bool,
+        compress: bool | None = None,
     ) -> tuple[RsvBits, bytes]:
         if not self._compressible_opcode(opcode):
+            return (rsv, data)
+
+        if opcode is not Opcode.CONTINUATION:
+            # The compression decision is taken once, before the first
+            # frame of the message is serialized, and carries over to
+            # every continuation frame of the message.
+            self._outbound_compressed = self._resolve_compression(
+                opcode, data, fin, compress,
+            )
+        elif self._outbound_compressed is None:
+            msg = "CONTINUATION frame without a preceding message"
+            raise ValueError(msg)
+
+        message_compressed = self._outbound_compressed
+
+        if not message_compressed:
+            if fin:
+                self._outbound_compressed = None
+            # An uncompressed message must not advance the compressor
+            # state, so that a following compressed message continues
+            # the compression context (or starts it, as negotiated).
             return (rsv, data)
 
         if opcode is not Opcode.CONTINUATION:
@@ -299,6 +418,8 @@ class PerMessageDeflate(Extension):
 
             if no_context_takeover:
                 self._compressor = None
+
+            self._outbound_compressed = None
 
         return (rsv, data)
 

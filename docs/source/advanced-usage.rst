@@ -70,6 +70,49 @@ directly.
     for event in connection.events():
         # As with WSConnection, only without any handshake events
 
+Per-message compression
+-----------------------
+
+When the ``permessage-deflate`` extension has been negotiated, every
+data message is compressed by default. Small messages, such as
+heartbeats, can be larger after compression, so individual messages can
+opt out with the ``compress`` hint on the outgoing event:
+
+.. code-block:: python
+
+    from wsproto.events import BytesMessage
+
+    # Sent uncompressed even though permessage-deflate is enabled.
+    connection.send(BytesMessage(data=b"ping", compress=False))
+    # An explicit True still compresses, and None (the default) keeps
+    # the extension's usual behavior.
+    connection.send(BytesMessage(data=large_payload, compress=True))
+
+The decision is taken from the first chunk of a message and applies to
+the whole message, including every continuation frame; a hint given on
+a continuation frame is ignored.
+
+Alternatively, the extension itself can carry a policy applied to every
+message that does not give an explicit hint. Passing ``False`` disables
+compression by default, while a callable receives
+:class:`~wsproto.extensions.MessageMetadata` describing the message's
+first frame, so the decision can be made from known metadata without
+buffering the whole message:
+
+.. code-block:: python
+
+    from wsproto.extensions import MessageMetadata, PerMessageDeflate
+
+    def maybe_compress(metadata: MessageMetadata) -> bool:
+        return metadata.payload_length > 64
+
+    extension = PerMessageDeflate(compress=maybe_compress)
+
+The policy is evaluated before any byte of the message is serialized, so
+an exception raised by the callable aborts the message without sending
+a partial frame. Uncompressed messages never advance the compression
+state, and control frames such as PING/PONG are never compressed.
+
 HTTP/2
 ------
 

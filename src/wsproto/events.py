@@ -222,11 +222,23 @@ class Message(Event, Generic[T]):
        True if this frame is the last one of this message, False if
        more frames are expected.
 
+    .. attribute:: compress
+
+       Outbound-only hint selecting whether this message should be
+       compressed by a negotiated permessage-deflate extension. The
+       decision is taken from the first chunk of a message and applies
+       to the whole message; it cannot be changed by later chunks.
+       ``True`` forces compression, ``False`` sends the message
+       uncompressed, and ``None`` (the default) defers to the
+       extension's own policy. It has no effect if permessage-deflate
+       was not negotiated.
+
     """
 
     data: T
     frame_finished: bool = True
     message_finished: bool = True
+    compress: bool | None = None
 
 
 @dataclass(frozen=True)

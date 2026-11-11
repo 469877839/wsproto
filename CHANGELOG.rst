@@ -6,6 +6,12 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Support selecting compression per message with the ``compress`` hint
+  on outbound ``Message`` events or a compression strategy on
+  ``PerMessageDeflate``. The decision is taken before the first frame
+  of each message and applies to every continuation frame.
+- Preserve decompression state when PING or PONG frames arrive between
+  compressed message fragments.
 
 1.3.2 (2025-11-20)
 ------------------

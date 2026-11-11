@@ -99,7 +99,9 @@ class Connection:
     def send(self, event: Event) -> bytes:
         data = b""
         if isinstance(event, Message) and self.state == ConnectionState.OPEN:
-            data += self._proto.send_data(event.data, event.message_finished)
+            data += self._proto.send_data(
+                event.data, event.message_finished, event.compress,
+            )
         elif isinstance(event, Ping) and self.state == ConnectionState.OPEN:
             data += self._proto.ping(event.payload)
         elif isinstance(event, Pong) and self.state == ConnectionState.OPEN:

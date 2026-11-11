@@ -740,6 +740,7 @@ class TestFrameDecoderExtensions:
             rsv: fp.RsvBits,
             data: bytes,
             fin: bool,
+            compress: Optional[bool] = None,
         ) -> Tuple[fp.RsvBits, bytes]:
             if opcode is fp.Opcode.TEXT:
                 rsv = fp.RsvBits(rsv.rsv1, rsv.rsv2, True)
