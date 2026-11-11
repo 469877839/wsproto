@@ -132,7 +132,17 @@ class Connection:
         :class:`~wsproto.events.CloseConnection` event is yielded from
         :meth:`~wsproto.connection.Connection.events`.
 
-        :param data: The data received from the remote peer on the network.
+        Passing ``None`` signals that the transport reached EOF. This moves
+        the connection straight to
+        :attr:`~wsproto.connection.ConnectionState.CLOSED` and queues a
+        synthetic :class:`~wsproto.events.CloseConnection` event with code
+        ``1006`` (abnormal closure). Frames that were received but not yet
+        consumed are still yielded by
+        :meth:`~wsproto.connection.Connection.events` afterwards, but no
+        buffered event can move the state out of ``CLOSED`` again.
+
+        :param data: The data received from the remote peer on the network,
+            or ``None`` to signal transport EOF.
         :type data: ``bytes``
         """
         if data is None:
@@ -161,7 +171,12 @@ class Connection:
         received frames are converted into events. For example, yielding a
         remote :class:`~wsproto.events.CloseConnection` event moves the
         connection into
-        :attr:`~wsproto.connection.ConnectionState.REMOTE_CLOSING`.
+        :attr:`~wsproto.connection.ConnectionState.REMOTE_CLOSING`, or into
+        :attr:`~wsproto.connection.ConnectionState.CLOSED` if a local close
+        was already sent. A close event that is only yielded after the
+        connection is already ``CLOSED`` (for instance following
+        ``receive_data(None)``) is still delivered but leaves the state
+        unchanged.
 
         :returns: generator of :class:`Event <wsproto.events.Event>` subclasses
         """
@@ -185,9 +200,13 @@ class Connection:
                 elif frame.opcode is Opcode.CLOSE:
                     assert isinstance(frame.payload, tuple)
                     code, reason = frame.payload
+                    # A close frame that was already buffered when the
+                    # connection reached CLOSED (e.g. via receive_data(None))
+                    # must not move the state backwards. The event is still
+                    # yielded so the application sees every parsed frame.
                     if self.state is ConnectionState.LOCAL_CLOSING:
                         self._state = ConnectionState.CLOSED
-                    else:
+                    elif self.state is ConnectionState.OPEN:
                         self._state = ConnectionState.REMOTE_CLOSING
                     yield CloseConnection(code=code, reason=reason)
 

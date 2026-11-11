@@ -123,6 +123,97 @@ you should iterate over this generator after receiving new network data.
 For a more complete example, see `synchronous_client.py
 <https://github.com/python-hyper/wsproto/blob/main/example/synchronous_client.py>`_.
 
+.. _state-transitions:
+
+When state transitions happen
+-----------------------------
+
+Passing bytes to :meth:`WSConnection.receive_data` only buffers the parsed
+frames. It does **not** apply the state transitions those frames cause. State
+advances while :meth:`WSConnection.events` is consumed, when each event is
+actually yielded. In particular, receiving the bytes of a close frame does not
+put the connection into ``REMOTE_CLOSING``; only yielding its
+:class:`~wsproto.events.CloseConnection` event does.
+
+This matters whenever your application consumes events lazily:
+
+* After ``receive_data()`` returns, ``connection.state`` reflects only the
+  events you have already consumed. A close frame sitting in an un-iterated
+  buffer is invisible to ``state``.
+* You may stop iterating ``events()`` early, call ``receive_data()`` again,
+  and resume the same generator later; buffered events keep their order and
+  their state transitions fire when they are yielded.
+* Until a remote ``CloseConnection`` has been consumed, the connection is
+  still ``OPEN``, so sending a local ``CloseConnection`` first is legal and
+  starts a simultaneous close. Consuming the remote event afterwards completes
+  the handshake and reaches ``CLOSED``.
+* Only ``CloseConnection`` events move the state. Pending
+  :class:`~wsproto.events.Ping`, :class:`~wsproto.events.Pong` and message
+  events never change ``ConnectionState``.
+* ``receive_data(None)`` signals transport EOF. It moves the connection
+  straight to ``CLOSED`` and queues a synthetic
+  ``CloseConnection(code=1006)`` event, even if other frames (including a
+  close frame that was never consumed) are still buffered. A close event
+  yielded afterwards never moves the state out of ``CLOSED``.
+
+In short: never treat "bytes were received" as "the application has consumed
+the close". Drive your shutdown logic off the ``CloseConnection`` event and
+off ``connection.state`` observed *after* consuming events.
+
+The table below lists call sequences that are exercised by the test suite
+(``tests/test_state_contract.py``), entirely in memory. "Visible events" are
+the event types yielded by ``events()`` in order.
+
+.. list-table:: Verified event-iteration and close-handshake sequences
+   :header-rows: 1
+   :widths: 20 30 22 28
+
+   * - Scenario
+     - Call sequence
+     - Visible events (in order)
+     - State and what may be sent
+   * - Data frame followed by close, consumed partially
+     - ``receive_data(data + close)``; consume one event; send local
+       ``CloseConnection``; consume the rest
+     - ``BytesMessage`` then ``CloseConnection``
+     - ``OPEN`` after the data; ``LOCAL_CLOSING`` after the local send;
+       ``CLOSED`` once the remote close is yielded
+   * - Both sides close simultaneously
+     - Both call ``send(CloseConnection)``; each calls ``receive_data``; then
+       both iterate ``events()``
+     - One ``CloseConnection`` per side
+     - ``LOCAL_CLOSING`` after the sends and after ``receive_data``;
+       ``CLOSED`` after consuming the event; no further sends accepted
+   * - Close consumed, then EOF
+     - ``receive_data(close)``; iterate ``events()``; ``receive_data(None)``;
+       iterate again
+     - ``CloseConnection(1000)`` then ``CloseConnection(1006)``
+     - ``REMOTE_CLOSING`` after the first event; ``CLOSED`` after EOF; the
+       synthetic event leaves it ``CLOSED``
+   * - Close received but not consumed, then EOF
+     - ``receive_data(close)`` (no iteration); ``receive_data(None)``; iterate
+       ``events()``
+     - ``CloseConnection(1006)`` then the buffered
+       ``CloseConnection(1000)``
+     - ``OPEN`` after ``receive_data``; ``CLOSED`` after EOF; the buffered
+       close is still delivered but does not regress the state
+   * - EOF without any close frame
+     - ``receive_data(None)``; iterate ``events()``
+     - ``CloseConnection(1006)``
+     - ``CLOSED`` immediately; no sends accepted
+   * - Pending, unconsumed ping
+     - ``receive_data(ping)`` without iterating; send data / ping / pong /
+       close
+     - ``Ping`` yielded only when ``events()`` is later consumed
+     - stays ``OPEN`` (then ``LOCAL_CLOSING`` after the local close); the
+       ping never changes the state
+   * - Local close, peer keeps sending data
+     - local ``send(CloseConnection)``; ``receive_data`` of two data frames
+       and a peer close; iterate ``events()``
+     - two ``BytesMessage`` then ``CloseConnection``
+     - ``LOCAL_CLOSING`` while bytes are buffered (all sends rejected);
+       ``CLOSED`` after the peer close is yielded
+
 WebSocket Servers
 -----------------
 
@@ -184,6 +275,19 @@ appropriate reply. For example,
 
 When the reply has been received by the initiator, it will also yield
 a ``CloseConnection`` event.
+
+Remember that the state change happens when the event is yielded, not when the
+close frame's bytes are passed to ``receive_data()``. If you feed a close
+frame into ``receive_data()`` but have not yet iterated ``events()``, the
+connection still reports ``OPEN`` and you can still send your own
+``CloseConnection``; consuming the remote event afterwards completes the
+handshake. See :ref:`state-transitions` for the full contract.
+
+If the transport closes without a close frame, call ``receive_data(None)``.
+This moves the connection to ``CLOSED`` and yields a synthetic
+``CloseConnection`` with code ``1006`` (abnormal closure); any frames still
+buffered are still yielded afterwards, but no event can move the state out of
+``CLOSED``.
 
 Regardless of which endpoint initiates the closing handshake, the server is
 responsible for tearing down the underlying connection. When a

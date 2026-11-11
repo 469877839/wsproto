@@ -6,6 +6,11 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Bugfix: a close frame that was received but not yet consumed when
+  ``receive_data(None)`` signaled transport EOF no longer moves the
+  connection state out of ``CLOSED`` (previously it regressed to
+  ``REMOTE_CLOSING``). The buffered ``CloseConnection`` event is still
+  yielded after the synthetic ``1006`` event.
 
 1.3.2 (2025-11-20)
 ------------------

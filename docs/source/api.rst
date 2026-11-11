@@ -27,7 +27,11 @@ Incoming bytes are parsed by ``receive_data()``, but state changes caused by
 received events are applied while ``events()`` is consumed. For example, when
 the remote peer sends a close frame, the connection enters
 ``REMOTE_CLOSING`` when the corresponding ``CloseConnection`` event is yielded,
-not when the bytes are first passed to ``receive_data()``.
+not when the bytes are first passed to ``receive_data()``. Buffered events
+that are yielded after the connection has already reached ``CLOSED`` (for
+example a close frame that was still queued when ``receive_data(None)``
+signaled transport EOF) are still delivered, but they never move the state
+backwards.
 
 .. autoclass:: wsproto.ConnectionType
    :members:
