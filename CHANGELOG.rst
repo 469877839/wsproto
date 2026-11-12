@@ -6,6 +6,20 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Split extension negotiation into three phases: ``parse_offer`` parses one
+  header element without touching state, ``can_accept``/``can_finalize``
+  judge whether it is acceptable, and ``establish`` creates the per-connection
+  runtime state. The legacy ``accept``/``finalize`` methods still work.
+- Reject malformed permessage-deflate offers: unknown or duplicated
+  parameters, invalid window sizes and values on value-less parameters.
+- Select at most one offer per extension name among multiple proposals,
+  without failed candidates leaking temporary state such as window bits.
+- Reject server responses containing extension parameters that were not
+  offered, and refuse to negotiate two extensions that contend for the same
+  RSV bit.
+- Copy negotiated extensions per connection so compressor and decompressor
+  state can never be shared across connections using the same configuration
+  object.
 
 1.3.2 (2025-11-20)
 ------------------

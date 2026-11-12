@@ -16,7 +16,8 @@ import h11
 
 from .connection import Connection, ConnectionState, ConnectionType
 from .events import AcceptConnection, Event, RejectConnection, RejectData, Request
-from .extensions import Extension
+from .extensions import Extension, ExtensionOffer
+from .frame_protocol import RsvBits
 from .utilities import (
     LocalProtocolError,
     RemoteProtocolError,
@@ -54,6 +55,7 @@ class H11Handshake:
         self._events: deque[Event] = deque()
         self._initiating_request: Request | None = None
         self._nonce: bytes | None = None
+        self._offered_extension_params: dict[str, object] = {}
 
     @property
     def state(self) -> ConnectionState:
@@ -304,7 +306,7 @@ class H11Handshake:
         )
         self._connection = Connection(
             ConnectionType.CLIENT if self.client else ConnectionType.SERVER,
-            event.extensions,
+            _connection_extensions(event.extensions),
         )
         self._state = ConnectionState.OPEN
         return self._h11_connection.send(response) or b""
@@ -364,9 +366,17 @@ class H11Handshake:
 
         if request.extensions:
             offers: dict[str, str | bool] = {}
+            self._offered_extension_params = {}
             for e in request.extensions:
                 assert isinstance(e, Extension)
-                offers[e.name] = e.offer()
+                params = e.offer()
+                offers[e.name] = params
+                if isinstance(params, str):
+                    parsed = e.parse_offer(
+                        ExtensionOffer(e.name, f"{e.name}; {params}"),
+                    )
+                    if parsed is not None:
+                        self._offered_extension_params[e.name] = parsed
             extensions = []
             for name, params in offers.items():
                 bname = name.encode("ascii")
@@ -441,12 +451,14 @@ class H11Handshake:
                 event_hint=RejectConnection(),
             )
         extensions = client_extensions_handshake(
-            accepts, cast("Sequence[Extension]", self._initiating_request.extensions),
+            accepts,
+            cast("Sequence[Extension]", self._initiating_request.extensions),
+            self._offered_extension_params,
         )
 
         self._connection = Connection(
             ConnectionType.CLIENT if self.client else ConnectionType.SERVER,
-            extensions,
+            _connection_extensions(extensions),
             self._h11_connection.trailing_data[0],
         )
         self._state = ConnectionState.OPEN
@@ -458,6 +470,37 @@ class H11Handshake:
         return f"{self.__class__.__name__}(client={self.client}, state={self.state})"
 
 
+def _parse_offer(raw: str) -> ExtensionOffer:
+    name = raw.split(";", 1)[0].strip()
+    return ExtensionOffer(name=name, raw=raw)
+
+
+def _connection_extensions(extensions: Iterable[Extension]) -> list[Extension]:
+    """
+    Return per-connection extensions.
+
+    The same extension object may be used to configure several connections,
+    but the compression state of each connection must be independent, so the
+    runtime uses a copy of each negotiated extension.
+    """
+    return [extension.copy() for extension in extensions]
+
+
+def _rsv_conflicts(extensions: Iterable[Extension]) -> list[str]:
+    """
+    Return the names of extensions that compete for the same RSV bit.
+    """
+    used = [False, False, False]
+    conflicts = []
+    for extension in extensions:
+        reserved = extension.reserved_bits()
+        if any(bit and used_bit for bit, used_bit in zip(reserved, used)):
+            conflicts.append(extension.name)
+        for index, bit in enumerate(reserved):
+            used[index] = used[index] or bit
+    return conflicts
+
+
 def server_extensions_handshake(
     requested: Iterable[str], supported: list[Extension],
 ) -> bytes | None:
@@ -467,16 +510,47 @@ def server_extensions_handshake(
     This returns None if there are no agreed extensions
     """
     accepts: dict[str, bool | bytes] = {}
-    for offer in requested:
-        name = offer.split(";", 1)[0].strip()
+    candidates: list[tuple[Extension, object]] = []
+    for raw_offer in requested:
+        offer = _parse_offer(raw_offer)
+        if offer.name in accepts:
+            # A single extension name may only be accepted once.
+            continue
         for extension in supported:
-            if extension.name == name:
-                accept = extension.accept(offer)
-                if isinstance(accept, bool):
-                    if accept:
-                        accepts[extension.name] = True
-                elif accept is not None:
-                    accepts[extension.name] = accept.encode("ascii")
+            if extension.name != offer.name:
+                continue
+            parsed = extension.parse_offer(offer)
+            if parsed is None:
+                # This candidate is malformed; other offers may still be
+                # acceptable, and no state has been touched.
+                continue
+            accept = extension.can_accept(parsed)
+            if accept is None or accept is False:
+                continue
+            candidates.append((extension, parsed))
+            if isinstance(accept, bool):
+                accepts[extension.name] = True
+            else:
+                accepts[extension.name] = accept.encode("ascii")
+            break
+
+    if not accepts:
+        return None
+
+    # An extension may not be accepted together with another extension that
+    # uses the same RSV bit.
+    for name in _rsv_conflicts(extension for extension, _ in candidates):
+        del accepts[name]
+        candidates = [
+            (extension, parsed)
+            for extension, parsed in candidates
+            if extension.name != name
+        ]
+
+    # Only now, once the surviving extensions are known, is the runtime
+    # state for this connection established.
+    for extension, parsed in candidates:
+        extension.establish(parsed)
 
     if accepts:
         extensions: list[bytes] = []
@@ -495,21 +569,57 @@ def server_extensions_handshake(
 
 
 def client_extensions_handshake(
-    accepted: Iterable[str], supported: Sequence[Extension],
+    accepted: Iterable[str],
+    supported: Sequence[Extension],
+    offered: dict[str, object] | None = None,
 ) -> list[Extension]:
     # This raises RemoteProtocolError is the accepted extension is not
     # supported.
     extensions = []
-    for accept in accepted:
-        name = accept.split(";", 1)[0].strip()
-        for extension in supported:
-            if extension.name == name:
-                extension.finalize(accept)
-                extensions.append(extension)
-                break
-        else:
-            msg = f"unrecognized extension {name}"
+    for raw_accept in accepted:
+        offer = _parse_offer(raw_accept)
+        if any(extension.name == offer.name for extension in extensions):
+            msg = f"duplicate extension {offer.name}"
             raise RemoteProtocolError(
                 msg, event_hint=RejectConnection(),
             )
+        for extension in supported:
+            if extension.name == offer.name:
+                parsed = extension.parse_offer(offer)
+                if parsed is None:
+                    msg = f"invalid parameters for extension {offer.name}"
+                    raise RemoteProtocolError(
+                        msg, event_hint=RejectConnection(),
+                    )
+                if not extension.can_finalize(parsed):
+                    msg = f"unacceptable parameters for extension {offer.name}"
+                    raise RemoteProtocolError(
+                        msg, event_hint=RejectConnection(),
+                    )
+                if offered is not None and offer.name in offered:
+                    if not extension.response_allowed(parsed, offered[offer.name]):
+                        msg = (
+                            f"extension {offer.name} accepted with parameters "
+                            "that were not offered"
+                        )
+                        raise RemoteProtocolError(
+                            msg, event_hint=RejectConnection(),
+                        )
+                extension.establish(parsed)
+                extensions.append(extension)
+                break
+        else:
+            msg = f"unrecognized extension {offer.name}"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+
+    # A response may not accept extensions that compete for the same RSV bit.
+    conflicts = _rsv_conflicts(extensions)
+    if conflicts:
+        msg = f"extensions conflict on RSV bits: {', '.join(conflicts)}"
+        raise RemoteProtocolError(
+            msg, event_hint=RejectConnection(),
+        )
+
     return extensions

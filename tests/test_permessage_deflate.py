@@ -8,6 +8,8 @@ import pytest
 
 from wsproto import extensions as wpext
 from wsproto import frame_protocol as fp
+from wsproto.extensions import ExtensionOffer
+from wsproto.utilities import RemoteProtocolError
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -50,7 +52,7 @@ class TestPerMessageDeflate:
         },
         {"client_no_context_takeover": True, "server_max_window_bits": 9},
         {"server_no_context_takeover": True, "client_max_window_bits": 9},
-        {"client_max_window_bits": None, "server_max_window_bits": None},
+        {"client_max_window_bits": None},
         {},
     ]
 
@@ -133,13 +135,14 @@ class TestPerMessageDeflate:
 
         assert ext.enabled()
 
-    def test_finalize_ignores_rubbish(self) -> None:
+    def test_finalize_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.finalize("i am the lizard queen; worship me")
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize("i am the lizard queen; worship me")
 
-        assert ext.enabled()
+        assert not ext.enabled()
 
     @pytest.mark.parametrize("params", parameter_sets)
     def test_accept(self, params: Params) -> None:
@@ -169,13 +172,203 @@ class TestPerMessageDeflate:
             assert ext.server_max_window_bits == bits
             assert "server_max_window_bits=%d" % bits in response
 
-    def test_accept_ignores_rubbish(self) -> None:
+    def test_accept_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.accept("i am the lizard queen; worship me")
+        response = ext.accept("i am the lizard queen; worship me")
 
+        assert response is None
+        assert not ext.enabled()
+
+    @pytest.mark.parametrize(
+        "offer",
+        [
+            "permessage-deflate; unknown_parameter",
+            "permessage-deflate; server_max_window_bits=10; server_max_window_bits=11",
+            "permessage-deflate; server_max_window_bits=99",
+            "permessage-deflate; server_max_window_bits=abc",
+            "permessage-deflate; client_no_context_takeover=true",
+            "i am the lizard queen; worship me",
+        ],
+    )
+    def test_parse_rejects_invalid_offers(self, offer: str) -> None:
+        ext = wpext.PerMessageDeflate()
+        assert ext.parse_offer(ExtensionOffer(ext.name, offer)) is None
+        assert ext.accept(offer) is None
+        assert not ext.enabled()
+        assert ext.server_max_window_bits == ext.DEFAULT_SERVER_MAX_WINDOW_BITS
+        assert ext.client_max_window_bits == ext.DEFAULT_CLIENT_MAX_WINDOW_BITS
+
+    def test_accept_rejects_bare_server_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        offer = ext.parse_offer(
+            ExtensionOffer(ext.name, "permessage-deflate; server_max_window_bits"),
+        )
+        assert offer is not None
+        assert ext.can_accept(offer) is None
+        assert not ext.enabled()
+
+    def test_accept_plain_offer(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        offer = ext.parse_offer(ExtensionOffer(ext.name, "permessage-deflate"))
+        assert offer is not None
+        assert ext.can_accept(offer) == ""
+        assert not ext.enabled()
+
+    def test_legacy_methods_accept_parameter_only_strings(self) -> None:
+        client_ext = wpext.PerMessageDeflate()
+        client_ext.finalize(client_ext.offer())
+        assert client_ext.enabled()
+
+        server_ext = wpext.PerMessageDeflate()
+        response = server_ext.accept(server_ext.offer())
+        assert response == "client_max_window_bits=15; server_max_window_bits=15"
+        assert server_ext.enabled()
+
+    def test_failed_candidate_leaves_no_state(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        bad = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=9; server_max_window_bits=99",
+            ),
+        )
+        assert bad is None
+        good = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=9; server_max_window_bits=10",
+            ),
+        )
+        assert good is not None
+        assert ext.can_accept(good) == (
+            "client_max_window_bits=9; server_max_window_bits=10"
+        )
+        # Judging an offer does not establish anything.
+        assert not ext.enabled()
+        assert ext.client_max_window_bits == ext.DEFAULT_CLIENT_MAX_WINDOW_BITS
+        assert ext.server_max_window_bits == ext.DEFAULT_SERVER_MAX_WINDOW_BITS
+        assert ext._compressor is None
+        assert ext._decompressor is None
+
+    def test_accept_picks_within_offered_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate(client_max_window_bits=12, server_max_window_bits=11)
+        offer = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=10; server_max_window_bits=14",
+            ),
+        )
+        assert offer is not None
+        assert ext.can_accept(offer) == (
+            "client_max_window_bits=10; server_max_window_bits=11"
+        )
+
+    def test_accept_rejects_offer_without_client_window_bits_support(self) -> None:
+        ext = wpext.PerMessageDeflate(client_max_window_bits=12)
+        offer = ext.parse_offer(ExtensionOffer(ext.name, "permessage-deflate"))
+        assert offer is not None
+        # A response must not contain client_max_window_bits if the offer
+        # didn't, so a server requiring it cannot accept this offer.
+        assert ext.can_accept(offer) is None
+
+    def test_accept_bare_client_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate(client_max_window_bits=12)
+        offer = ext.parse_offer(
+            ExtensionOffer(ext.name, "permessage-deflate; client_max_window_bits"),
+        )
+        assert offer is not None
+        assert offer.client_max_window_bits_bare
+        assert ext.can_accept(offer) == "client_max_window_bits=12"
+
+    def test_client_finalize_rejects_unoffered_client_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        # A bare client_max_window_bits is only legal in an offer, never in a
+        # response, and an offer that did not include the parameter cannot be
+        # answered with one.
+        response = ext.parse_offer(
+            ExtensionOffer(ext.name, "permessage-deflate; client_max_window_bits"),
+        )
+        assert response is not None
+        assert not ext.can_finalize(response)
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize("permessage-deflate; client_max_window_bits")
+        assert not ext.enabled()
+
+    def test_client_finalize_rejects_excessive_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate(client_max_window_bits=10, server_max_window_bits=10)
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize("permessage-deflate; server_max_window_bits=12")
+        assert not ext.enabled()
+
+    def test_establish_creates_independent_runtime(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        offer = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=11; server_max_window_bits=12",
+            ),
+        )
+        assert offer is not None
+        ext.establish(offer)
         assert ext.enabled()
+
+        clone = ext.copy()
+        assert clone is not ext
+        assert clone.enabled()
+        assert clone.client_max_window_bits == 11
+        assert clone.server_max_window_bits == 12
+        assert clone._compressor is None
+        assert clone._decompressor is None
+
+        # Using the clone must not create a compressor on the original.
+        proto = fp.FrameProtocol(client=True, extensions=[clone])
+        rsv = fp.RsvBits(False, False, False)
+        clone.frame_outbound(proto, fp.Opcode.TEXT, rsv, b"hello world", True)
+        assert clone._compressor is not None
+        assert ext._compressor is None
+
+    def test_reserved_bits(self) -> None:
+        assert wpext.PerMessageDeflate().reserved_bits() == fp.RsvBits(True, False, False)
+
+    def test_response_allowed_against_offer(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        offered = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits; server_max_window_bits=12",
+            ),
+        )
+        allowed = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=10; server_max_window_bits=11",
+            ),
+        )
+        not_allowed = ext.parse_offer(
+            ExtensionOffer(
+                ext.name,
+                "permessage-deflate; client_max_window_bits=10; server_max_window_bits=13",
+            ),
+        )
+        assert offered is not None
+        assert allowed is not None
+        assert not_allowed is not None
+        assert ext.response_allowed(allowed, offered)
+        assert not ext.response_allowed(not_allowed, offered)
+
+    def test_response_allowed_rejects_unoffered_client_window_bits(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        offered = ext.parse_offer(
+            ExtensionOffer(ext.name, "permessage-deflate; server_max_window_bits=12"),
+        )
+        response = ext.parse_offer(
+            ExtensionOffer(ext.name, "permessage-deflate; client_max_window_bits=10"),
+        )
+        assert offered is not None
+        assert response is not None
+        assert not ext.response_allowed(response, offered)
 
     def test_inbound_uncompressed_control_frame(self) -> None:
         payload = b"x" * 23

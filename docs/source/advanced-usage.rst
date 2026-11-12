@@ -116,9 +116,16 @@ and for a client
     accepted_extensions: List[str]
     proposed_extensions = [PerMessageDeflate()]
     extensions = client_extensions_handshake(accepted_extensions, proposed_extensions)
-    connection = Connection(ConnectionType.CLIENT, supported_extensions)
+    connection = Connection(ConnectionType.CLIENT, extensions)
 
 any data received on the stream should be passed to the ``connection``
 via the ``receive_bytes`` method and bytes returned from the
 ``connection.send`` method should be wrapped in a HTTP/2 data frame
 and sent.
+
+The same extension configuration object may be reused across
+connections: negotiation is split into parsing an offer, deciding
+whether it can be accepted, and establishing the per-connection runtime
+state. A :class:`Connection <wsproto.connection.Connection>` copies the
+negotiated extensions, so compressor and decompressor state is never
+shared between connections.

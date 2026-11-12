@@ -88,7 +88,12 @@ class Connection:
         """
         self.client = connection_type is ConnectionType.CLIENT
         self._events: deque[Event] = deque()
-        self._proto = FrameProtocol(self.client, extensions or [])
+        # Each connection needs its own extension runtime state, so the
+        # negotiated extension objects are copied rather than shared.
+        self._proto = FrameProtocol(
+            self.client,
+            [extension.copy() for extension in extensions or []],
+        )
         self._state = ConnectionState.OPEN
         self.receive_data(trailing_data)
 
